@@ -3,72 +3,79 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Models\Producto;
 use App\Models\Venta;
-use Illuminate\Http\JsonResponse;
+use App\Models\Producto;
+use App\Models\Ingreso;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Carbon\Carbon;
 
 class VentaController extends Controller
 {
-    public function index(): JsonResponse
+    public function index()
     {
         $ventas = Venta::with(['cliente', 'detalles.producto'])
             ->orderBy('fecha', 'desc')
             ->get();
 
-        return response()->json([
-            'data'    => $ventas,
-            'message' => 'Ventas obtenidas correctamente',
-        ]);
+        return response()->json(['data' => $ventas]);
     }
 
-    public function store(Request $request): JsonResponse
+    public function store(Request $request)
     {
-        $validated = $request->validate([
-            'cliente_id'                    => 'required|exists:clientes,id',
-            'fecha'                         => 'required|date',
-            'detalles'                      => 'required|array|min:1',
-            'detalles.*.producto_id'        => 'required|exists:productos,id',
-            'detalles.*.cantidad'           => 'required|integer|min:1',
-            'detalles.*.precio_unitario'    => 'required|numeric|min:0',
+        $request->validate([
+            'cliente_id'              => 'required|exists:clientes,id',
+            'fecha'                   => 'required|date',
+            'detalles'                => 'required|array|min:1',
+            'detalles.*.producto_id'  => 'required|exists:productos,id',
+            'detalles.*.cantidad'     => 'required|integer|min:1',
         ]);
 
         DB::beginTransaction();
 
         try {
-            // Crear la venta con total en 0 (se recalcula al final)
-            $venta = Venta::create([
-                'cliente_id' => $validated['cliente_id'],
-                'fecha'      => $validated['fecha'],
-                'total'      => 0,
-            ]);
+            $total = 0;
+            $detallesData = [];
 
-            foreach ($validated['detalles'] as $detalle) {
+            foreach ($request->detalles as $detalle) {
                 $producto = Producto::findOrFail($detalle['producto_id']);
 
-                // Validar stock disponible
-                if (!$producto->tieneStock($detalle['cantidad'])) {
-                    DB::rollBack();
+                if ($producto->stock < $detalle['cantidad']) {
                     return response()->json([
-                        'message' => "Stock insuficiente para el producto: {$producto->nombre}",
+                        'message' => "Stock insuficiente para: {$producto->nombre}"
                     ], 422);
                 }
 
-                // Crear detalle (subtotal se calcula automáticamente en el model)
-                $venta->detalles()->create([
-                    'producto_id'     => $detalle['producto_id'],
-                    'cantidad'        => $detalle['cantidad'],
-                    'precio_unitario' => $detalle['precio_unitario'],
-                    'subtotal'        => 0, // Se sobreescribe en el evento saving
-                ]);
+                $subtotal = $producto->precio * $detalle['cantidad'];
+                $total   += $subtotal;
 
-                // Descontar stock
+                $detallesData[] = [
+                    'producto_id'     => $producto->id,
+                    'cantidad'        => $detalle['cantidad'],
+                    'precio_unitario' => $producto->precio,
+                    'subtotal'        => $subtotal,
+                ];
+
                 $producto->decrement('stock', $detalle['cantidad']);
             }
 
-            // Recalcular total de la venta
-            $venta->recalcularTotal();
+            $venta = Venta::create([
+                'cliente_id' => $request->cliente_id,
+                'fecha'      => $request->fecha,
+                'total'      => $total,
+            ]);
+
+            $venta->detalles()->createMany($detallesData);
+
+            // Registrar ingreso automático
+            Ingreso::create([
+                'tipo'        => 'venta',
+                'descripcion' => 'Venta #' . $venta->id . ' — ' . $venta->cliente->nombre,
+                'monto'       => $venta->total,
+                'venta_id'    => $venta->id,
+                'fecha'       => Carbon::now()->toDateString(),
+                'hora'        => Carbon::now()->toTimeString(),
+            ]);
 
             DB::commit();
 
@@ -79,46 +86,40 @@ class VentaController extends Controller
 
         } catch (\Exception $e) {
             DB::rollBack();
-            return response()->json([
-                'message' => 'Error al registrar la venta',
-                'error'   => $e->getMessage(),
-            ], 500);
+            return response()->json(['message' => 'Error al registrar la venta: ' . $e->getMessage()], 500);
         }
     }
 
-    public function show(Venta $venta): JsonResponse
+    public function show(Venta $venta)
     {
         return response()->json([
-            'data'    => $venta->load(['cliente', 'detalles.producto']),
-            'message' => 'Venta obtenida correctamente',
+            'data' => $venta->load(['cliente', 'detalles.producto'])
         ]);
     }
 
-    public function destroy(Venta $venta): JsonResponse
+    public function destroy(Venta $venta)
     {
         DB::beginTransaction();
 
         try {
-            // Restaurar stock de cada producto al eliminar la venta
+            // Restaurar stock
             foreach ($venta->detalles as $detalle) {
                 $detalle->producto->increment('stock', $detalle->cantidad);
             }
+
+            // Eliminar ingreso asociado
+            Ingreso::where('venta_id', $venta->id)->delete();
 
             $venta->detalles()->delete();
             $venta->delete();
 
             DB::commit();
 
-            return response()->json([
-                'message' => 'Venta eliminada correctamente',
-            ]);
+            return response()->json(['message' => 'Venta eliminada correctamente']);
 
         } catch (\Exception $e) {
             DB::rollBack();
-            return response()->json([
-                'message' => 'Error al eliminar la venta',
-                'error'   => $e->getMessage(),
-            ], 500);
+            return response()->json(['message' => 'Error al eliminar la venta: ' . $e->getMessage()], 500);
         }
     }
 }

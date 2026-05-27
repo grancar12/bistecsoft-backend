@@ -11,7 +11,7 @@ class ClienteController extends Controller
 {
     public function index(): JsonResponse
     {
-        $clientes = Cliente::orderBy('nombre')->get();
+        $clientes = Cliente::orderBy('created_at', 'desc')->get();
 
         return response()->json([
             'data'    => $clientes,

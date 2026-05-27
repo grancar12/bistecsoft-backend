@@ -11,7 +11,7 @@ class ProductoController extends Controller
 {
     public function index(): JsonResponse
     {
-        $productos = Producto::orderBy('nombre')->get();
+        $productos = Producto::orderBy('created_at', 'desc')->get();
 
         return response()->json([
             'data'    => $productos,
